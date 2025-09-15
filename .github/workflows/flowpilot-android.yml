@@ -1,0 +1,96 @@
+name: Flowpilot Android (debug)
+
+on:
+  workflow_dispatch: {}
+  push: { branches: [ main, master ] }
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      ANDROID_SDK_ROOT: ${{ runner.temp }}/android-sdk
+      ANDROID_HOME: ${{ runner.temp }}/android-sdk
+      GRADLE_OPTS: -Dorg.gradle.daemon=false -Dorg.gradle.parallel=false -Dorg.gradle.workers.max=1 -Dorg.gradle.vfs.watch=false -Dfile.encoding=UTF-8
+      JAVA_TOOL_OPTIONS: -Xmx2g
+    steps:
+      - uses: actions/checkout@v4
+        with: { submodules: recursive }
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: '17' }
+      - name: Install Android SDK
+        run: |
+          set -e
+          mkdir -p "$ANDROID_SDK_ROOT/cmdline-tools" "$ANDROID_SDK_ROOT/platform-tools"
+          cd "$ANDROID_SDK_ROOT/cmdline-tools"
+          curl -sSL -o cmdtools.zip https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+          rm -rf latest tmp && mkdir -p tmp
+          unzip -q cmdtools.zip -d tmp && rm -f cmdtools.zip
+          mkdir -p latest && mv tmp/cmdline-tools/* latest/ && rm -rf tmp
+          export PATH="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin:$ANDROID_SDK_ROOT/platform-tools:$PATH"
+          yes | sdkmanager --sdk_root="$ANDROID_SDK_ROOT" --licenses >/dev/null
+          sdkmanager --sdk_root="$ANDROID_SDK_ROOT" \
+            "platform-tools" \
+            "platforms;android-34" "build-tools;34.0.0" \
+            "platforms;android-33" "build-tools;33.0.2" \
+            "ndk;25.2.9519653" >/dev/null
+          echo "sdk.dir=$ANDROID_SDK_ROOT" > local.properties
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+      - name: Install p4a/buildozer
+        run: |
+          python -m pip install --upgrade pip
+          pip install "python-for-android==2024.01.21" buildozer
+      - name: Build flowy AAR
+        run: |
+          set -e
+          export PATH="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin:$ANDROID_SDK_ROOT/platform-tools:$PATH"
+          cd flowy
+          buildozer appclean || true
+          buildozer -v android debug
+          AAR="$(find . -type f -name '*.aar' | head -n1 || true)"
+          mkdir -p ../android/libs
+          [ -n "$AAR" ] && cp "$AAR" ../android/libs/openpilot-0.1-arm64-v8a-debug.aar
+      - name: Init script (deps shim)
+        run: |
+          cat > build-init.gradle <<'EOF'
+          initscript {
+            repositories { mavenCentral() }
+            dependencies { classpath "com.sun.activation:javax.activation:1.2.0" }
+          }
+          allprojects {
+            buildscript {
+              repositories { mavenCentral() }
+              dependencies { classpath "com.sun.activation:javax.activation:1.2.0" }
+            }
+            repositories { mavenCentral() }
+            configurations.all {
+              resolutionStrategy.eachDependency { d ->
+                if (d.requested.group == "javax.activation" || d.requested.group == "jakarta.activation") {
+                  d.useTarget("com.sun.activation:javax.activation:1.2.0")
+                }
+                if (d.requested.group == "org.nd4j" && d.requested.name == "nd4j-native") {
+                  d.useTarget("org.nd4j:nd4j-native:1.0.0-M2.1:linux-x86_64")
+                }
+                if (d.requested.group == "org.bytedeco" && d.requested.name == "javacpp") {
+                  d.useTarget("org.bytedeco:javacpp:1.5.10:linux-x86_64")
+                }
+                if (d.requested.group == "org.bytedeco" && d.requested.name == "openblas") {
+                  d.useTarget("org.bytedeco:openblas:0.3.26-1.5.10:linux-x86_64")
+                }
+              }
+            }
+          }
+          EOF
+      - name: Build Android debug APK
+        run: ./gradlew --no-daemon -I build-init.gradle :android:assembleDebug
+      - name: Collect APKs
+        run: |
+          mkdir -p artifacts
+          find android -type f -name "*debug*.apk" -exec cp -v {} artifacts/ \; || true
+          ls -al artifacts || true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: flowpilot-apk-debug
+          path: artifacts/*.apk
+          if-no-files-found: error
